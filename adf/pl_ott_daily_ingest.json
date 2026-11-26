@@ -1,0 +1,119 @@
+{
+  "name": "pl_ott_daily_ingest",
+  "properties": {
+    "description": "Daily incremental OTT watch-history load: landing -> bronze -> Spark silver -> SQL warehouse refresh.",
+    "parameters": { "run_date": { "type": "string", "defaultValue": "2026-11-01" } },
+    "activities": [
+      {
+        "name": "CheckLandingPartition",
+        "type": "GetMetadata",
+        "description": "Is dt=<run_date> present in the landing zone?",
+        "typeProperties": {
+          "dataset": { "referenceName": "ds_adls_landing_events_folder", "type": "DatasetReference",
+                       "parameters": { "folder": "@concat('events/dt=', pipeline().parameters.run_date)" } },
+          "fieldList": [ "exists", "childItems" ]
+        }
+      },
+      {
+        "name": "IfPartitionExists",
+        "type": "IfCondition",
+        "dependsOn": [ { "activity": "CheckLandingPartition", "dependencyConditions": [ "Succeeded" ] } ],
+        "typeProperties": {
+          "expression": { "value": "@activity('CheckLandingPartition').output.exists", "type": "Expression" },
+          "ifTrueActivities": [
+            {
+              "name": "CopyEventsToBronze",
+              "type": "Copy",
+              "description": "Incremental: copies only the one day's folder (binary copy, immutable bronze).",
+              "typeProperties": { "source": { "type": "BinarySource" }, "sink": { "type": "BinarySink" } },
+              "inputs":  [ { "referenceName": "ds_adls_landing_events_day", "type": "DatasetReference", "parameters": { "run_date": "@pipeline().parameters.run_date" } } ],
+              "outputs": [ { "referenceName": "ds_adls_bronze_events_day",  "type": "DatasetReference", "parameters": { "run_date": "@pipeline().parameters.run_date" } } ]
+            },
+            {
+              "name": "CopyReferenceToBronze",
+              "type": "Copy",
+              "dependsOn": [ { "activity": "CopyEventsToBronze", "dependencyConditions": [ "Succeeded" ] } ],
+              "typeProperties": { "source": { "type": "BinarySource" }, "sink": { "type": "BinarySink" } },
+              "inputs":  [ { "referenceName": "ds_adls_landing_reference", "type": "DatasetReference" } ],
+              "outputs": [ { "referenceName": "ds_adls_bronze_reference",  "type": "DatasetReference" } ]
+            },
+            {
+              "name": "SparkSilverClean",
+              "type": "DatabricksSparkPython",
+              "description": "src/silver_clean.py --run-date <date>. Standardise text, completion_pct, dedupe session_id, write partitioned silver.",
+              "dependsOn": [ { "activity": "CopyReferenceToBronze", "dependencyConditions": [ "Succeeded" ] } ],
+              "typeProperties": {
+                "pythonFile": "dbfs:/ott/silver_clean.py",
+                "parameters": [ "--input", "abfss://bronze@<storage>.dfs.core.windows.net/ott",
+                                "--output", "abfss://silver@<storage>.dfs.core.windows.net/ott",
+                                "--run-date", "@pipeline().parameters.run_date" ]
+              },
+              "linkedServiceName": { "referenceName": "ls_databricks", "type": "LinkedServiceReference" }
+            },
+            {
+              "name": "SparkGoldMarts",
+              "type": "DatabricksSparkPython",
+              "dependsOn": [ { "activity": "SparkSilverClean", "dependencyConditions": [ "Succeeded" ] } ],
+              "typeProperties": {
+                "pythonFile": "dbfs:/ott/gold_marts.py",
+                "parameters": [ "--output", "abfss://silver@<storage>.dfs.core.windows.net/ott" ]
+              },
+              "linkedServiceName": { "referenceName": "ls_databricks", "type": "LinkedServiceReference" }
+            },
+            {
+              "name": "CopyGoldFactToStaging",
+              "type": "Copy",
+              "dependsOn": [ { "activity": "SparkGoldMarts", "dependencyConditions": [ "Succeeded" ] } ],
+              "typeProperties": {
+                "source": { "type": "ParquetSource",
+                            "storeSettings": { "type": "AzureBlobFSReadSettings", "wildcardFolderPath": "@concat('gold/fact_watch_events/event_date=', pipeline().parameters.run_date)" } },
+                "sink": { "type": "AzureSqlSink", "preCopyScript": "TRUNCATE TABLE stg.watch_events" }
+              },
+              "inputs":  [ { "referenceName": "ds_adls_gold_fact", "type": "DatasetReference" } ],
+              "outputs": [ { "referenceName": "ds_sql_stg_watch_events", "type": "DatasetReference" } ]
+            },
+            {
+              "name": "CopyDimsToStaging",
+              "type": "Copy",
+              "dependsOn": [ { "activity": "CopyGoldFactToStaging", "dependencyConditions": [ "Succeeded" ] } ],
+              "description": "dim_show and dim_user parquet -> stg.show / stg.[user] (truncate + load). Duplicate this activity per dimension.",
+              "typeProperties": { "source": { "type": "ParquetSource" }, "sink": { "type": "AzureSqlSink", "preCopyScript": "TRUNCATE TABLE stg.show" } },
+              "inputs":  [ { "referenceName": "ds_adls_gold_dim_show", "type": "DatasetReference" } ],
+              "outputs": [ { "referenceName": "ds_sql_stg_show", "type": "DatasetReference" } ]
+            },
+            {
+              "name": "RefreshWarehouse",
+              "type": "SqlServerStoredProcedure",
+              "dependsOn": [ { "activity": "CopyDimsToStaging", "dependencyConditions": [ "Succeeded" ] } ],
+              "typeProperties": {
+                "storedProcedureName": "dwh.usp_refresh_warehouse",
+                "storedProcedureParameters": {
+                  "run_date": { "value": "@pipeline().parameters.run_date", "type": "DateTime" },
+                  "pipeline_run_id": { "value": "@pipeline().RunId", "type": "String" } }
+              },
+              "linkedServiceName": { "referenceName": "ls_azure_sql", "type": "LinkedServiceReference" }
+            },
+            {
+              "name": "LogFailure",
+              "type": "SqlServerStoredProcedure",
+              "dependsOn": [ { "activity": "SparkSilverClean", "dependencyConditions": [ "Failed" ] } ],
+              "typeProperties": {
+                "storedProcedureName": "ops.usp_log_failure",
+                "storedProcedureParameters": {
+                  "run_date": { "value": "@pipeline().parameters.run_date", "type": "DateTime" },
+                  "pipeline_run_id": { "value": "@pipeline().RunId", "type": "String" },
+                  "step": { "value": "SparkSilverClean", "type": "String" },
+                  "message": { "value": "silver cleaning failed - see Databricks run", "type": "String" } }
+              },
+              "linkedServiceName": { "referenceName": "ls_azure_sql", "type": "LinkedServiceReference" }
+            }
+          ],
+          "ifFalseActivities": [
+            { "name": "WaitForLateFile", "type": "Wait", "typeProperties": { "waitTimeInSeconds": 1 },
+              "description": "Partition missing: end quietly. The tumbling-window trigger retries and an ADF alert covers repeated misses." }
+          ]
+        }
+      }
+    ]
+  }
+}

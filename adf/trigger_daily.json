@@ -1,0 +1,13 @@
+{
+  "name": "tr_daily_ott",
+  "properties": {
+    "type": "TumblingWindowTrigger",
+    "description": "One run per day window; retries and backfill of missed days come for free from tumbling windows.",
+    "typeProperties": {
+      "frequency": "Hour", "interval": 24, "startTime": "2026-11-01T00:00:00Z", "delay": "02:00:00",
+      "maxConcurrency": 1, "retryPolicy": { "count": 2, "intervalInSeconds": 900 }
+    },
+    "pipeline": { "pipelineReference": { "referenceName": "pl_ott_daily_ingest", "type": "PipelineReference" },
+                  "parameters": { "run_date": "@formatDateTime(trigger().outputs.windowStartTime,'yyyy-MM-dd')" } }
+  }
+}
